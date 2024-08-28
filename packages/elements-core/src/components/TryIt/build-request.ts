@@ -1,7 +1,7 @@
 import { Dictionary, HttpParamStyles, IHttpOperation, IMediaTypeContent, IServer } from '@stoplight/types';
 import { Request as HarRequest } from 'har-format';
 
-import { getServerUrlWithDefaultValues } from '../../utils/http-spec/IServer';
+import { getServerUrlWithVariableValues, resolveUrl } from '../../utils/http-spec/IServer';
 import {
   filterOutAuthorizationParams,
   HttpSecuritySchemeWithValues,
@@ -25,9 +25,10 @@ interface BuildRequestInput {
   httpOperation: IHttpOperation;
   mediaTypeContent: IMediaTypeContent | undefined;
   parameterValues: Dictionary<string, string>;
+  serverVariableValues: Dictionary<string, string>;
   bodyInput?: BodyParameterValues | string;
   mockData?: MockData;
-  auth?: HttpSecuritySchemeWithValues;
+  auth?: HttpSecuritySchemeWithValues[];
   chosenServer?: IServer | null;
   credentials?: 'omit' | 'include' | 'same-origin';
   corsProxy?: string;
@@ -38,16 +39,23 @@ const getServerUrl = ({
   httpOperation,
   mockData,
   corsProxy,
-}: Pick<BuildRequestInput, 'httpOperation' | 'chosenServer' | 'mockData' | 'corsProxy'>) => {
+  serverVariableValues,
+}: Pick<BuildRequestInput, 'httpOperation' | 'chosenServer' | 'mockData' | 'corsProxy' | 'serverVariableValues'>) => {
   const server = chosenServer || httpOperation.servers?.[0];
-  const chosenServerUrl = server && getServerUrlWithDefaultValues(server);
-  const serverUrl = mockData?.url || chosenServerUrl || window.location.origin;
+  const chosenServerUrl = server && getServerUrlWithVariableValues(server, serverVariableValues);
+  const serverUrl = resolveUrl(mockData?.url || chosenServerUrl || window.location.origin);
 
   if (corsProxy && !mockData) {
     return `${corsProxy}${serverUrl}`;
   }
 
   return serverUrl;
+};
+
+const delimiter = {
+  [HttpParamStyles.Form]: ',',
+  [HttpParamStyles.SpaceDelimited]: ' ',
+  [HttpParamStyles.PipeDelimited]: '|',
 };
 
 export const getQueryParams = ({
@@ -57,7 +65,7 @@ export const getQueryParams = ({
   const query = httpOperation.request?.query;
   if (!query) return [];
 
-  return query.reduce((acc, param) => {
+  return query.reduce<{ name: string; value: string }[]>((acc, param) => {
     const value = parameterValues[param.name] ?? '';
     if (value.length === 0) return acc;
 
@@ -85,8 +93,14 @@ export const getQueryParams = ({
     } else if (param.schema?.type === 'array' && value) {
       let nested: string[];
       try {
-        nested = JSON.parse(value);
-        if (!Array.isArray(nested)) throw Error();
+        const parsed = JSON.parse(value);
+        if (typeof parsed === 'string') {
+          nested = parsed.split(delimiter[param.style as keyof typeof delimiter]);
+        } else if (Array.isArray(parsed)) {
+          nested = parsed;
+        } else {
+          throw Error();
+        }
       } catch (e) {
         throw new Error(`Cannot use param value "${value}". JSON array expected.`);
       }
@@ -94,14 +108,9 @@ export const getQueryParams = ({
       if (explode) {
         acc.push(...nested.map(value => ({ name: param.name, value: value.toString() })));
       } else {
-        const delimiter = {
-          [HttpParamStyles.Form]: ',',
-          [HttpParamStyles.SpaceDelimited]: ' ',
-          [HttpParamStyles.PipeDelimited]: '|',
-        };
         acc.push({
           name: param.name,
-          value: nested.join(delimiter[param.style] ?? delimiter[HttpParamStyles.Form]),
+          value: nested.join(delimiter[param.style as keyof typeof delimiter] ?? delimiter[HttpParamStyles.Form]),
         });
       }
     } else {
@@ -109,7 +118,7 @@ export const getQueryParams = ({
     }
 
     return acc;
-  }, [] as Array<{ name: string; value: string }>);
+  }, []);
 };
 
 export async function buildFetchRequest({
@@ -117,15 +126,17 @@ export async function buildFetchRequest({
   mediaTypeContent,
   bodyInput,
   parameterValues,
+  serverVariableValues,
   mockData,
   auth,
   chosenServer,
   credentials = 'omit',
   corsProxy,
 }: BuildRequestInput): Promise<Parameters<typeof fetch>> {
-  const serverUrl = getServerUrl({ httpOperation, mockData, chosenServer, corsProxy });
+  const serverUrl = getServerUrl({ httpOperation, mockData, chosenServer, corsProxy, serverVariableValues });
 
-  const shouldIncludeBody = ['PUT', 'POST', 'PATCH'].includes(httpOperation.method.toUpperCase());
+  const shouldIncludeBody =
+    ['PUT', 'POST', 'PATCH'].includes(httpOperation.method.toUpperCase()) && bodyInput !== undefined;
 
   const queryParams = getQueryParams({ httpOperation, parameterValues });
 
@@ -143,11 +154,14 @@ export async function buildFetchRequest({
 
   const body = typeof bodyInput === 'object' ? await createRequestBody(mediaTypeContent, bodyInput) : bodyInput;
 
+  const acceptedMimeTypes = getAcceptedMimeTypes(httpOperation);
   const headers = {
+    ...(acceptedMimeTypes.length > 0 && { Accept: acceptedMimeTypes.join(', ') }),
     // do not include multipart/form-data - browser handles its content type and boundary
-    ...(mediaTypeContent?.mediaType !== 'multipart/form-data' && {
-      'Content-Type': mediaTypeContent?.mediaType ?? 'application/json',
-    }),
+    ...(mediaTypeContent?.mediaType !== 'multipart/form-data' &&
+      shouldIncludeBody && {
+        'Content-Type': mediaTypeContent?.mediaType ?? 'application/json',
+      }),
     ...Object.fromEntries(headersWithAuth.map(nameAndValueObjectToPair)),
     ...mockData?.header,
   };
@@ -164,58 +178,59 @@ export async function buildFetchRequest({
 }
 
 const runAuthRequestEhancements = (
-  auth: HttpSecuritySchemeWithValues | undefined,
+  auths: HttpSecuritySchemeWithValues[] | undefined,
   queryParams: NameAndValue[],
   headers: NameAndValue[],
 ): [NameAndValue[], NameAndValue[]] => {
-  if (!auth) return [queryParams, headers];
+  if (!auths) return [queryParams, headers];
 
   const newQueryParams = [...queryParams];
   const newHeaders = [...headers];
+  auths.forEach(auth => {
+    if (isApiKeySecurityScheme(auth.scheme)) {
+      if (auth.scheme.in === 'query') {
+        newQueryParams.push({
+          name: auth.scheme.name,
+          value: auth.authValue || '123',
+        });
+      }
 
-  if (isApiKeySecurityScheme(auth.scheme)) {
-    if (auth.scheme.in === 'query') {
-      newQueryParams.push({
-        name: auth.scheme.name,
-        value: auth.authValue ?? '',
-      });
+      if (auth.scheme.in === 'header') {
+        newHeaders.push({
+          name: auth.scheme.name,
+          value: auth.authValue || '123',
+        });
+      }
     }
 
-    if (auth.scheme.in === 'header') {
+    if (isOAuth2SecurityScheme(auth.scheme)) {
       newHeaders.push({
-        name: auth.scheme.name,
-        value: auth.authValue ?? '',
+        name: 'Authorization',
+        value: auth.authValue || 'Bearer 123',
       });
     }
-  }
 
-  if (isOAuth2SecurityScheme(auth.scheme)) {
-    newHeaders.push({
-      name: 'Authorization',
-      value: auth.authValue ?? '',
-    });
-  }
+    if (isBearerSecurityScheme(auth.scheme)) {
+      newHeaders.push({
+        name: 'Authorization',
+        value: `Bearer ${auth.authValue || '123'}`,
+      });
+    }
 
-  if (isBearerSecurityScheme(auth.scheme)) {
-    newHeaders.push({
-      name: 'Authorization',
-      value: `Bearer ${auth.authValue}`,
-    });
-  }
+    if (isDigestSecurityScheme(auth.scheme)) {
+      newHeaders.push({
+        name: 'Authorization',
+        value: auth.authValue?.replace(/\s\s+/g, ' ').trim() || '123',
+      });
+    }
 
-  if (isDigestSecurityScheme(auth.scheme)) {
-    newHeaders.push({
-      name: 'Authorization',
-      value: auth.authValue?.replace(/\s\s+/g, ' ').trim() ?? '',
-    });
-  }
-
-  if (isBasicSecurityScheme(auth.scheme)) {
-    newHeaders.push({
-      name: 'Authorization',
-      value: `Basic ${auth.authValue}`,
-    });
-  }
+    if (isBasicSecurityScheme(auth.scheme)) {
+      newHeaders.push({
+        name: 'Authorization',
+        value: `Basic ${auth.authValue || '123'}`,
+      });
+    }
+  });
 
   return [newQueryParams, newHeaders];
 };
@@ -224,16 +239,18 @@ export async function buildHarRequest({
   httpOperation,
   bodyInput,
   parameterValues,
+  serverVariableValues,
   mediaTypeContent,
   auth,
   mockData,
   chosenServer,
   corsProxy,
 }: BuildRequestInput): Promise<HarRequest> {
-  const serverUrl = getServerUrl({ httpOperation, mockData, chosenServer, corsProxy });
+  const serverUrl = getServerUrl({ httpOperation, mockData, chosenServer, corsProxy, serverVariableValues });
 
   const mimeType = mediaTypeContent?.mediaType ?? 'application/json';
-  const shouldIncludeBody = ['PUT', 'POST', 'PATCH'].includes(httpOperation.method.toUpperCase());
+  const shouldIncludeBody =
+    ['PUT', 'POST', 'PATCH'].includes(httpOperation.method.toUpperCase()) && bodyInput !== undefined;
 
   const queryParams = getQueryParams({ httpOperation, parameterValues });
 
@@ -243,6 +260,15 @@ export async function buildHarRequest({
 
   if (mockData?.header) {
     headerParams.push({ name: 'Prefer', value: mockData.header.Prefer });
+  }
+
+  if (shouldIncludeBody) {
+    headerParams.push({ name: 'Content-Type', value: mimeType });
+  }
+
+  const acceptedMimeTypes = getAcceptedMimeTypes(httpOperation);
+  if (acceptedMimeTypes.length > 0) {
+    headerParams.push({ name: 'Accept', value: acceptedMimeTypes.join(', ') });
   }
 
   const [queryParamsWithAuth, headerParamsWithAuth] = runAuthRequestEhancements(auth, queryParams, headerParams);
@@ -277,7 +303,7 @@ export async function buildHarRequest({
     url: urlObject.href,
     httpVersion: 'HTTP/1.1',
     cookies: [],
-    headers: [{ name: 'Content-Type', value: mimeType }, ...headerParamsWithAuth],
+    headers: headerParamsWithAuth,
     queryString: queryParamsWithAuth,
     postData: postData,
     headersSize: -1,
@@ -290,6 +316,18 @@ function uriExpand(uri: string, data: Dictionary<string, string>) {
     return uri;
   }
   return uri.replace(/{([^#?]+?)}/g, (match, value) => {
-    return data[value] || value;
+    return data[value] || match;
   });
+}
+
+export function getAcceptedMimeTypes(httpOperation: IHttpOperation): string[] {
+  return Array.from(
+    new Set(
+      httpOperation.responses.flatMap(response =>
+        response === undefined || response.contents === undefined
+          ? []
+          : response.contents.map(contentType => contentType.mediaType),
+      ),
+    ),
+  );
 }

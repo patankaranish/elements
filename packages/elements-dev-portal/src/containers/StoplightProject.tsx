@@ -1,13 +1,14 @@
 import {
   findFirstNode,
   ReactRouterMarkdownLink,
+  RouterTypeContext,
   RoutingProps,
   SidebarLayout,
   useRouter,
   withStyles,
 } from '@stoplight/elements-core';
 import * as React from 'react';
-import { Link, Redirect, Route, useHistory, useParams } from 'react-router-dom';
+import { Link, Redirect, Route, Switch, useHistory, useParams } from 'react-router-dom';
 
 import { BranchSelector } from '../components/BranchSelector';
 import { DevPortalProvider } from '../components/DevPortalProvider';
@@ -51,6 +52,18 @@ export interface StoplightProjectProps extends RoutingProps {
   hideExport?: boolean;
 
   /**
+   * Allows to the server information
+   * @default false
+   */
+  hideServerInfo?: boolean;
+
+  /**
+   * Allows to hide the security schemes
+   * @default false
+   */
+  hideSecurityInfo?: boolean;
+
+  /**
    * If set to true, all table of contents panels will be collapsed.
    * @default false
    */
@@ -75,13 +88,16 @@ export interface StoplightProjectProps extends RoutingProps {
 const StoplightProjectImpl: React.FC<StoplightProjectProps> = ({
   projectId,
   hideTryIt,
+  hideSecurityInfo,
+  hideServerInfo,
   hideMocking,
   hideExport,
   collapseTableOfContents = false,
   tryItCredentialsPolicy,
   tryItCorsProxy,
 }) => {
-  const { branchSlug = '', nodeSlug = '' } = useParams<{ branchSlug?: string; nodeSlug: string }>();
+  const { branchSlug: encodedBranchSlug = '', nodeSlug = '' } = useParams<{ branchSlug?: string; nodeSlug: string }>();
+  const branchSlug = decodeURIComponent(encodedBranchSlug);
   const history = useHistory();
 
   const { data: tableOfContents, isFetched: isTocFetched } = useGetTableOfContents({ projectId, branchSlug });
@@ -96,6 +112,7 @@ const StoplightProjectImpl: React.FC<StoplightProjectProps> = ({
     projectId,
     branchSlug,
   });
+
   const container = React.useRef<HTMLDivElement>(null);
 
   if (!nodeSlug && isTocFetched && tableOfContents?.items) {
@@ -133,6 +150,8 @@ const StoplightProjectImpl: React.FC<StoplightProjectProps> = ({
         hideTryIt={hideTryIt}
         hideMocking={hideMocking}
         hideExport={hideExport}
+        hideSecurityInfo={hideSecurityInfo}
+        hideServerInfo={hideServerInfo}
         tryItCredentialsPolicy={tryItCredentialsPolicy}
         tryItCorsProxy={tryItCorsProxy}
       />
@@ -150,13 +169,14 @@ const StoplightProjectImpl: React.FC<StoplightProjectProps> = ({
       ref={container}
       sidebar={
         <>
-          {branches && branches.length > 1 ? (
+          {branches && branches.items.length > 1 ? (
             <BranchSelector
               branchSlug={branchSlug}
-              branches={branches}
-              onChange={branch =>
-                history.push(branch.is_default ? `/${nodeSlug}` : `/branches/${branch.slug}/${nodeSlug}`)
-              }
+              branches={branches.items}
+              onChange={branch => {
+                const encodedBranchSlug = encodeURIComponent(branch.slug);
+                history.push(branch.is_default ? `/${nodeSlug}` : `/branches/${encodedBranchSlug}/${nodeSlug}`);
+              }}
             />
           ) : null}
           {tableOfContents ? (
@@ -187,19 +207,23 @@ const StoplightProjectRouter = ({
 
   return (
     <DevPortalProvider platformUrl={platformUrl}>
-      <Router {...routerProps} key={basePath}>
-        <Route path="/branches/:branchSlug/:nodeSlug" exact>
-          <StoplightProjectImpl {...props} />
-        </Route>
+      <RouterTypeContext.Provider value={router}>
+        <Router {...routerProps} key={basePath}>
+          <Switch>
+            <Route path="/branches/:branchSlug/:nodeSlug+" exact>
+              <StoplightProjectImpl {...props} />
+            </Route>
 
-        <Route path="/:nodeSlug" exact>
-          <StoplightProjectImpl {...props} />
-        </Route>
+            <Route path="/:nodeSlug+" exact>
+              <StoplightProjectImpl {...props} />
+            </Route>
 
-        <Route path="/" exact>
-          <StoplightProjectImpl {...props} />
-        </Route>
-      </Router>
+            <Route path="/" exact>
+              <StoplightProjectImpl {...props} />
+            </Route>
+          </Switch>
+        </Router>
+      </RouterTypeContext.Provider>
     </DevPortalProvider>
   );
 };
